@@ -1,0 +1,196 @@
+```python
+#!/usr/bin/env python3
+"""
+Bounty Watcher Service.
+
+Monitors open bounties from the Algora/GitHub API:
+- On initial run: aggregates all existing open bounties into a single summary issue.
+- On subsequent runs: creates an individual issue for each new bounty detected.
+"""
+
+import json
+import os
+import sys
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Set
+import urllib.error
+import urllib.request
+
+
+@dataclass
+class Bounty:
+    id: str
+    title: str
+    url: str
+    reward: int
+    currency: str = "USD"
+    status: str = "open"
+
+
+class BountyWatcher:
+    def __init__(
+        self,
+        github_token: str,
+        target_repo: str,
+        user_to_cc: str = "habibdxb01",
+        state_file: str = "bounty_watcher_state.json",
+        algora_api_url: str = "https://api.algora.io/bounties",
+    ):
+        self.github_token = github_token
+        self.target_repo = target_repo
+        self.user_to_cc = user_to_cc
+        self.state_file = Path(state_file)
+        self.algora_api_url = algora_api_url
+        self.seen_bounty_ids: Set[str] = self._load_state()
+
+    def _load_state(self) -> Set[str]:
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return set(data.get("seen_ids", []))
+            except Exception as e:
+                sys.stderr.write(f"Warning: Failed to read state file: {e}\n")
+        return set()
+
+    def _save_state(self) -> None:
+        try:
+            with open(self.state_file, "w", encoding="utf-8") as f:
+                json.dump({"seen_ids": sorted(list(self.seen_bounty_ids))}, f, indent=2)
+        except Exception as e:
+            sys.stderr.write(f"Error: Failed to save state file: {e}\n")
+
+    def fetch_open_bounties(self) -> List[Bounty]:
+        req = urllib.request.Request(
+            f"{self.algora_api_url}?status=open",
+            headers={"User-Agent": "BountyWatcher/1.0", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                items = data.get("items", data) if isinstance(data, dict) else data
+                bounties = []
+                for item in items:
+                    bounties.append(
+                        Bounty(
+                            id=str(item.get("id", item.get("gh_id", ""))),
+                            title=item.get("title", "Untitled Bounty"),
+                            url=item.get("url", item.get("html_url", "")),
+                            reward=int(item.get("amount", item.get("reward", 0))),
+                            currency=item.get("currency", "USD"),
+                            status=item.get("status", "open"),
+                        )
+                    )
+                return sorted(bounties, key=lambda b: b.reward, reverse=True)
+        except Exception as e:
+            sys.stderr.write(f"Error fetching bounties: {e}\n")
+            return []
+
+    def create_github_issue(self, title: str, body: str) -> bool:
+        url = f"https://api.github.com/repos/{self.target_repo}/issues"
+        payload = json.dumps({"title": title, "body": body}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {self.github_token}",
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+                "User-Agent": "BountyWatcher/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.status in (200, 201)
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8")
+            sys.stderr.write(f"GitHub API error ({e.code}): {error_body}\n")
+            return False
+        except Exception as e:
+            sys.stderr.write(f"Error creating GitHub issue: {e}\n")
+            return False
+
+    def build_summary_body(self, bounties: List[Bounty]) -> str:
+        lines = [
+            "Bounties that were already open when the watcher started. From now on, each new one gets its own issue.\n"
+        ]
+        for b in bounties:
+            lines.append(f"- 🔴 **${b.reward}** · [{b.title}]({b.url})")
+
+        if self.user_to_cc:
+            lines.append(f"\ncc @{self.user_to_cc.lstrip('@')}")
+
+        for b in bounties:
+            lines.append(f"<!-- algora:gh-{b.id} -->")
+
+        return "\n".join(lines)
+
+    def build_individual_body(self, bounty: Bounty) -> str:
+        lines = [
+            f"### 🔴 Bounty Details: **${bounty.reward}**",
+            "",
+            f"- **Issue Link:** [{bounty.title}]({bounty.url})",
+            f"- **Reward:** ${bounty.reward} {bounty.currency}",
+            f"- **Status:** {bounty.status}",
+        ]
+        if self.user_to_cc:
+            lines.append(f"\ncc @{self.user_to_cc.lstrip('@')}")
+
+        lines.append(f"<!-- algora:gh-{bounty.id} -->")
+        return "\n".join(lines)
+
+    def run_once(self) -> None:
+        open_bounties = self.fetch_open_bounties()
+        if not open_bounties:
+            return
+
+        is_initial_run = len(self.seen_bounty_ids) == 0
+
+        if is_initial_run:
+            body = self.build_summary_body(open_bounties)
+            title = "Bounties that were already open when the watcher started"
+            if self.create_github_issue(title=title, body=body):
+                for b in open_bounties:
+                    self.seen_bounty_ids.add(b.id)
+                self._save_state()
+        else:
+            new_bounties = [b for b in open_bounties if b.id not in self.seen_bounty_ids]
+            for bounty in new_bounties:
+                title = f"🔴 **${bounty.reward}** · {bounty.title}"
+                body = self.build_individual_body(bounty)
+                if self.create_github_issue(title=title, body=body):
+                    self.seen_bounty_ids.add(bounty.id)
+                    self._save_state()
+                    time.sleep(1)
+
+
+def main() -> None:
+    github_token = os.environ.get("GITHUB_TOKEN")
+    target_repo = os.environ.get("GITHUB_REPOSITORY")
+    target_user = os.environ.get("TARGET_USER", "habibdxb01")
+    poll_interval = int(os.environ.get("POLL_INTERVAL", "0"))
+
+    if not github_token or not target_repo:
+        sys.stderr.write("Error: GITHUB_TOKEN and GITHUB_REPOSITORY must be set.\n")
+        sys.exit(1)
+
+    watcher = BountyWatcher(
+        github_token=github_token,
+        target_repo=target_repo,
+        user_to_cc=target_user,
+    )
+
+    if poll_interval > 0:
+        while True:
+            watcher.run_once()
+            time.sleep(poll_interval)
+    else:
+        watcher.run_once()
+
+
+if __name__ == "__main__":
+    main()
+```
