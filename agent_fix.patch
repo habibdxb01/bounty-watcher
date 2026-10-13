@@ -1,196 +1,389 @@
 ```python
-#!/usr/bin/env python3
+# watcher.py
 """
-Bounty Watcher Service.
-
-Monitors open bounties from the Algora/GitHub API:
-- On initial run: aggregates all existing open bounties into a single summary issue.
-- On subsequent runs: creates an individual issue for each new bounty detected.
+Bounty Watcher: Monitors Algora bounties and creates an individual GitHub issue
+for every bounty discovered (ensuring no grouping into a single summary issue).
 """
 
 import json
 import os
+import re
 import sys
 import time
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Set
 import urllib.error
 import urllib.request
+from typing import Dict, List, Optional, Set
+
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY")  # e.g., "habibdxb01/bounty-tracker"
+STATE_FILE = os.getenv("STATE_FILE", "seen_bounties.json")
+CC_USER = os.getenv("CC_USER", "habibdxb01")
+ALGORA_API_URL = "https://api.algora.io/bounties"
 
 
-@dataclass
-class Bounty:
-    id: str
-    title: str
-    url: str
-    reward: int
-    currency: str = "USD"
-    status: str = "open"
-
-
-class BountyWatcher:
-    def __init__(
-        self,
-        github_token: str,
-        target_repo: str,
-        user_to_cc: str = "habibdxb01",
-        state_file: str = "bounty_watcher_state.json",
-        algora_api_url: str = "https://api.algora.io/bounties",
-    ):
-        self.github_token = github_token
-        self.target_repo = target_repo
-        self.user_to_cc = user_to_cc
-        self.state_file = Path(state_file)
-        self.algora_api_url = algora_api_url
-        self.seen_bounty_ids: Set[str] = self._load_state()
-
-    def _load_state(self) -> Set[str]:
-        if self.state_file.exists():
-            try:
-                with open(self.state_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    return set(data.get("seen_ids", []))
-            except Exception as e:
-                sys.stderr.write(f"Warning: Failed to read state file: {e}\n")
-        return set()
-
-    def _save_state(self) -> None:
+def load_seen_bounties() -> Set[str]:
+    """Load previously processed bounty IDs."""
+    if os.path.exists(STATE_FILE):
         try:
-            with open(self.state_file, "w", encoding="utf-8") as f:
-                json.dump({"seen_ids": sorted(list(self.seen_bounty_ids))}, f, indent=2)
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return set(data) if isinstance(data, list) else set(data.keys())
         except Exception as e:
-            sys.stderr.write(f"Error: Failed to save state file: {e}\n")
+            print(f"Error loading {STATE_FILE}: {e}", file=sys.stderr)
+    return set()
 
-    def fetch_open_bounties(self) -> List[Bounty]:
-        req = urllib.request.Request(
-            f"{self.algora_api_url}?status=open",
-            headers={"User-Agent": "BountyWatcher/1.0", "Accept": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                items = data.get("items", data) if isinstance(data, dict) else data
-                bounties = []
-                for item in items:
-                    bounties.append(
-                        Bounty(
-                            id=str(item.get("id", item.get("gh_id", ""))),
-                            title=item.get("title", "Untitled Bounty"),
-                            url=item.get("url", item.get("html_url", "")),
-                            reward=int(item.get("amount", item.get("reward", 0))),
-                            currency=item.get("currency", "USD"),
-                            status=item.get("status", "open"),
-                        )
-                    )
-                return sorted(bounties, key=lambda b: b.reward, reverse=True)
-        except Exception as e:
-            sys.stderr.write(f"Error fetching bounties: {e}\n")
+
+def save_seen_bounties(seen_ids: Set[str]) -> None:
+    """Save processed bounty IDs to disk."""
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(list(seen_ids)), f, indent=2)
+    except Exception as e:
+        print(f"Error saving {STATE_FILE}: {e}", file=sys.stderr)
+
+
+def fetch_algora_bounties() -> List[Dict]:
+    """Fetch current bounties from Algora API."""
+    req = urllib.request.Request(
+        ALGORA_API_URL,
+        headers={"User-Agent": "Algora-Bounty-Watcher/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, dict) and "items" in data:
+                return data["items"]
+            elif isinstance(data, list):
+                return data
             return []
+    except Exception as e:
+        print(f"Failed to fetch bounties from Algora: {e}", file=sys.stderr)
+        return []
 
-    def create_github_issue(self, title: str, body: str) -> bool:
-        url = f"https://api.github.com/repos/{self.target_repo}/issues"
-        payload = json.dumps({"title": title, "body": body}).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {self.github_token}",
-                "Accept": "application/vnd.github+json",
-                "Content-Type": "application/json",
-                "User-Agent": "BountyWatcher/1.0",
-            },
-            method="POST",
+
+def create_github_issue(title: str, body: str) -> Optional[int]:
+    """Create a new GitHub issue in the target repository."""
+    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
+        print(
+            f"[DRY-RUN] Would create issue:\nTitle: {title}\nBody:\n{body}\n{'-'*40}"
         )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return resp.status in (200, 201)
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8")
-            sys.stderr.write(f"GitHub API error ({e.code}): {error_body}\n")
-            return False
-        except Exception as e:
-            sys.stderr.write(f"Error creating GitHub issue: {e}\n")
-            return False
+        return None
 
-    def build_summary_body(self, bounties: List[Bounty]) -> str:
-        lines = [
-            "Bounties that were already open when the watcher started. From now on, each new one gets its own issue.\n"
-        ]
-        for b in bounties:
-            lines.append(f"- 🔴 **${b.reward}** · [{b.title}]({b.url})")
+    url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/issues"
+    payload = json.dumps({"title": title, "body": body}).encode("utf-8")
 
-        if self.user_to_cc:
-            lines.append(f"\ncc @{self.user_to_cc.lstrip('@')}")
-
-        for b in bounties:
-            lines.append(f"<!-- algora:gh-{b.id} -->")
-
-        return "\n".join(lines)
-
-    def build_individual_body(self, bounty: Bounty) -> str:
-        lines = [
-            f"### 🔴 Bounty Details: **${bounty.reward}**",
-            "",
-            f"- **Issue Link:** [{bounty.title}]({bounty.url})",
-            f"- **Reward:** ${bounty.reward} {bounty.currency}",
-            f"- **Status:** {bounty.status}",
-        ]
-        if self.user_to_cc:
-            lines.append(f"\ncc @{self.user_to_cc.lstrip('@')}")
-
-        lines.append(f"<!-- algora:gh-{bounty.id} -->")
-        return "\n".join(lines)
-
-    def run_once(self) -> None:
-        open_bounties = self.fetch_open_bounties()
-        if not open_bounties:
-            return
-
-        is_initial_run = len(self.seen_bounty_ids) == 0
-
-        if is_initial_run:
-            body = self.build_summary_body(open_bounties)
-            title = "Bounties that were already open when the watcher started"
-            if self.create_github_issue(title=title, body=body):
-                for b in open_bounties:
-                    self.seen_bounty_ids.add(b.id)
-                self._save_state()
-        else:
-            new_bounties = [b for b in open_bounties if b.id not in self.seen_bounty_ids]
-            for bounty in new_bounties:
-                title = f"🔴 **${bounty.reward}** · {bounty.title}"
-                body = self.build_individual_body(bounty)
-                if self.create_github_issue(title=title, body=body):
-                    self.seen_bounty_ids.add(bounty.id)
-                    self._save_state()
-                    time.sleep(1)
-
-
-def main() -> None:
-    github_token = os.environ.get("GITHUB_TOKEN")
-    target_repo = os.environ.get("GITHUB_REPOSITORY")
-    target_user = os.environ.get("TARGET_USER", "habibdxb01")
-    poll_interval = int(os.environ.get("POLL_INTERVAL", "0"))
-
-    if not github_token or not target_repo:
-        sys.stderr.write("Error: GITHUB_TOKEN and GITHUB_REPOSITORY must be set.\n")
-        sys.exit(1)
-
-    watcher = BountyWatcher(
-        github_token=github_token,
-        target_repo=target_repo,
-        user_to_cc=target_user,
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "Bounty-Watcher-Bot",
+        },
+        method="POST",
     )
 
-    if poll_interval > 0:
-        while True:
-            watcher.run_once()
-            time.sleep(poll_interval)
-    else:
-        watcher.run_once()
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            res_data = json.loads(resp.read().decode("utf-8"))
+            issue_number = res_data.get("number")
+            print(f"Created issue #{issue_number}: {title}")
+            return issue_number
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8")
+        print(
+            f"HTTP error creating issue: {e.code} - {error_body}",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        print(f"Error creating issue: {e}", file=sys.stderr)
+    return None
+
+
+def format_issue_title(reward: str, title: str) -> str:
+    """Format standard bounty issue title."""
+    reward_clean = reward.strip().replace("**", "")
+    return f"🔴 {reward_clean} · {title.strip()}"
+
+
+def format_issue_body(
+    title: str, reward: str, url: str, bounty_id: str
+) -> str:
+    """Format issue body with bounty reference, CC mention, and tracking comment."""
+    cc_text = f"cc @{CC_USER}" if CC_USER else ""
+    return (
+        f"### [{reward}] {title}\n\n"
+        f"- **Source Issue:** {url}\n"
+        f"- **Reward:** {reward}\n\n"
+        f"{cc_text}\n\n"
+        f"<!-- algora:gh-{bounty_id} -->\n"
+    )
+
+
+def process_bounty(bounty: Dict, seen_ids: Set[str]) -> bool:
+    """Process a single bounty and create an individual issue if not yet seen."""
+    bounty_id = str(
+        bounty.get("id")
+        or bounty.get("gh_id")
+        or bounty.get("algora_id")
+        or ""
+    )
+    if not bounty_id:
+        return False
+
+    if bounty_id in seen_ids:
+        return False
+
+    title = bounty.get("title", "Untitled Bounty")
+    reward = bounty.get("reward") or bounty.get("amount") or "$0"
+    if not str(reward).startswith("$"):
+        reward = f"${reward}"
+    url = bounty.get("url") or bounty.get("html_url") or ""
+
+    issue_title = format_issue_title(reward, title)
+    issue_body = format_issue_body(title, reward, url, bounty_id)
+
+    create_github_issue(issue_title, issue_body)
+    seen_ids.add(bounty_id)
+    save_seen_bounties(seen_ids)
+    return True
+
+
+def run_watcher():
+    """Main watcher execution loop/run."""
+    seen_ids = load_seen_bounties()
+    bounties = fetch_algora_bounties()
+
+    new_count = 0
+    for bounty in bounties:
+        if process_bounty(bounty, seen_ids):
+            new_count += 1
+            time.sleep(1)  # Rate limit margin between issue creations
+
+    print(f"Watcher execution complete. {new_count} new issues created.")
 
 
 if __name__ == "__main__":
-    main()
+    run_watcher()
+```
+
+```python
+# backfill_bounties.py
+"""
+Backfill script: Splits the already-open initial bounties into their own
+individual GitHub issues and marks them in the watcher's state file.
+"""
+
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from typing import Dict, List, Set
+
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY")
+STATE_FILE = os.getenv("STATE_FILE", "seen_bounties.json")
+CC_USER = os.getenv("CC_USER", "habibdxb01")
+
+INITIAL_BOUNTIES_RAW = """
+- 🔴 **$900** · [[ Crypto ] Fix cross-chain replay attack in CrossChainBridge signature verificat](https://github.com/UnsafeLabs/Bounty-Hunters/issues/920)
+- 🔴 **$800** · [[ Crypto ] Fix MultiSigWallet confirmation race condition during execution callb](https://github.com/UnsafeLabs/Bounty-Hunters/issues/916)
+- 🔴 **$800** · [[ Laravel ] Implement webhook system with signature verification and retry queue](https://github.com/UnsafeLabs/Bounty-Hunters/issues/754)
+- 🔴 **$780** · [Pixel Art Creation with high Creative Thinking](https://github.com/SecureBananaLabs/bug-bounty/issues/80)
+- 🔴 **$750** · [Benchmark APIs with p50, p95, p99 latency, RPS, error rate and TTFB](https://github.com/SecureBananaLabs/bug-bounty/issues/30)
+- 🔴 **$700** · [[ Crypto ] Fix tx.origin phishing vulnerability in GovernanceToken delegation](https://github.com/UnsafeLabs/Bounty-Hunters/issues/912)
+- 🔴 **$700** · [[ FastAPI ] Implement standardized pagination with offset and cursor support](https://github.com/UnsafeLabs/Bounty-Hunters/issues/802)
+- 🔴 **$700** · [Low Handing Fruit Automation](https://github.com/SecureBananaLabs/bug-bounty/issues/743)
+- 🔴 **$650** · [[ T3 Code ] Add multi-session management with device tracking and revocation](https://github.com/UnsafeLabs/Bounty-Hunters/issues/835)
+- 🔴 **$600** · [[ Crypto ] Fix first-depositor price manipulation in LiquidityPool](https://github.com/UnsafeLabs/Bounty-Hunters/issues/918)
+- 🔴 **$600** · [[ Laravel ] Implement file upload system with checksum dedup and thumbnail gener](https://github.com/UnsafeLabs/Bounty-Hunters/issues/790)
+- 🔴 **$550** · [[ Crypto ] Fix phantom reward accrual after period expiry in YieldVault](https://github.com/UnsafeLabs/Bounty-Hunters/issues/914)
+- 🔴 **$500** · [[ T3 Code ] Implement automatic token refresh in ACP client with Effect retry](https://github.com/UnsafeLabs/Bounty-Hunters/issues/829)
+- 🔴 **$450** · [[ Crypto ] Fix reentrancy vulnerability in StakingVault withdraw and claimReward](https://github.com/UnsafeLabs/Bounty-Hunters/issues/911)
+- 🔴 **$450** · [[ T3 Code ] Add Effect.Stream-based streaming to Codex integration with backpres](https://github.com/UnsafeLabs/Bounty-Hunters/issues/845)
+- 🔴 **$450** · [[ Laravel ] Implement user notification preferences with channel routing](https://github.com/UnsafeLabs/Bounty-Hunters/issues/793)
+- 🔴 **$430** · [Technical Poem Generation and Content Creation](https://github.com/SecureBananaLabs/bug-bounty/issues/76)
+- 🔴 **$400** · [[ T3 Code ] Fix SSH askpass script leaking password via insecure temp file permi](https://github.com/UnsafeLabs/Bounty-Hunters/issues/822)
+- 🔴 **$400** · [[ FastAPI ] Add SSE disconnect detection, event filtering, and reconnect replay](https://github.com/UnsafeLabs/Bounty-Hunters/issues/798)
+- 🔴 **$400** · [[ Laravel ] Add caching layer to config loading and fix cache store connection v](https://github.com/UnsafeLabs/Bounty-Hunters/issues/747)
+- 🔴 **$380** · [[ T3 Code ] Add sliding window metrics aggregation with Effect.Stream](https://github.com/UnsafeLabs/Bounty-Hunters/issues/856)
+- 🔴 **$350** · [[ Crypto ] Fix integer overflow in TokenVesting calculation for large allocation](https://github.com/UnsafeLabs/Bounty-Hunters/issues/917)
+- 🔴 **$350** · [[ T3 Code ] Add checkpoint snapshot pruning with retention policy and CLI comman](https://github.com/UnsafeLabs/Bounty-Hunters/issues/838)
+- 🔴 **$350** · [[ Laravel ] Implement audit logging trait for Eloquent model change tracking](https://github.com/UnsafeLabs/Bounty-Hunters/issues/786)
+- 🔴 **$350** · [[ FastAPI ] Add rate limiting and key rotation support to API key authentication](https://github.com/UnsafeLabs/Bounty-Hunters/issues/768)
+- 🔴 **$350** · [Implement Secure Payment Gateway and Payment Service](https://github.com/SecureBananaLabs/bug-bounty/issues/1)
+- 🔴 **$310** · [[ T3 Code ] Add Effect.Cache-based provider API response caching with TTL](https://github.com/UnsafeLabs/Bounty-Hunters/issues/865)
+- 🔴 **$300** · [[ Crypto ] Fix missing slippage protection and deadline in SimpleSwap](https://github.com/UnsafeLabs/Bounty-Hunters/issues/913)
+- 🔴 **$300** · [[ T3 Code ] Add IPC message queuing for backend disconnect resilience](https://github.com/UnsafeLabs/Bounty-Hunters/issues/826)
+- 🔴 **$300** · [[ FastAPI ] Implement dynamic CORS origin validation with callback support](https://github.com/UnsafeLabs/Bounty-Hunters/issues/763)
+- 🔴 **$280** · [[ T3 Code ] Add Tailscale peer diagnostics with latency graph](https://github.com/UnsafeLabs/Bounty-Hunters/issues/844)
+- 🔴 **$260** · [[ T3 Code ] Add gzip and brotli response compression to HTTP layer](https://github.com/UnsafeLabs/Bounty-Hunters/issues/863)
+- 🔴 **$250** · [[ Crypto ] Fix zero-fee flash loans and add pool drainage protection](https://github.com/UnsafeLabs/Bounty-Hunters/issues/919)
+- 🔴 **$250** · [[ T3 Code ] Add backend health monitoring and auto-restart to DesktopBackendMana](https://github.com/UnsafeLabs/Bounty-Hunters/issues/820)
+- 🔴 **$250** · [[ FastAPI ] Add router-level middleware support to APIRouter](https://github.com/UnsafeLabs/Bounty-Hunters/issues/796)
+- 🔴 **$250** · [[ Laravel ] Add email verification flow and fix mail configuration for SMTP fall](https://github.com/UnsafeLabs/Bounty-Hunters/issues/756)
+- 🔴 **$230** · [[ T3 Code ] Add deferred command scheduler with Effect.Schedule and SQLite persi](https://github.com/UnsafeLabs/Bounty-Hunters/issues/851)
+- 🔴 **$220** · [[ T3 Code ] Add SSH tunnel keepalive and automatic reconnection with backoff](https://github.com/UnsafeLabs/Bounty-Hunters/issues/832)
+- 🔴 **$200** · [[ Crypto ] Fix PriceOracle missing staleness check and fallback mechanism](https://github.com/UnsafeLabs/Bounty-Hunters/issues/915)
+- 🔴 **$200** · [[ T3 Code ] Enable SQLite WAL mode and add Effect.Pool connection pooling](https://github.com/UnsafeLabs/Bounty-Hunters/issues/858)
+- 🔴 **$200** · [[ FastAPI ] Add FastAPITestClient with auth helpers and WebSocket convenience me](https://github.com/UnsafeLabs/Bounty-Hunters/issues/804)
+- 🔴 **$200** · [[ Laravel ] Implement API authentication controller with token-based login and r](https://github.com/UnsafeLabs/Bounty-Hunters/issues/752)
+- 🔴 **$190** · [[ T3 Code ] Add request body size limiting with per-route overrides](https://github.com/UnsafeLabs/Bounty-Hunters/issues/841)
+- 🔴 **$180** · [[ T3 Code ] Add runtime validation for provider configuration schemas](https://github.com/UnsafeLabs/Bounty-Hunters/issues/825)
+- 🔴 **$180** · [[ FastAPI ] Add WebSocket heartbeat with configurable ping interval and disconne](https://github.com/UnsafeLabs/Bounty-Hunters/issues/766)
+- 🔴 **$175** · [[ Laravel ] Implement lightweight role-based access control with permissions](https://github.com/UnsafeLabs/Bounty-Hunters/issues/788)
+- 🔴 **$170** · [[ T3 Code ] Standardize server error types with Effect.Data.TaggedEnum](https://github.com/UnsafeLabs/Bounty-Hunters/issues/861)
+- 🔴 **$160** · [[ T3 Code ] Add encryption key rotation for desktop safe storage credentials](https://github.com/UnsafeLabs/Bounty-Hunters/issues/848)
+- 🔴 **$150** · [📱 Epic: BAWES Universe Mobile App (Android + iOS)](https://github.com/BAWES-Universe/workadventure-universe/issues/1)
+- 🔴 **$150** · [[ T3 Code ] Add Developer and Git menus to Electron application menu bar](https://github.com/UnsafeLabs/Bounty-Hunters/issues/831)
+- 🔴 **$150** · [[ FastAPI ] Add OAuth2 token refresh support to security module](https://github.com/UnsafeLabs/Bounty-Hunters/issues/758)
+- 🔴 **$140** · [[ T3 Code ] Add branch protection status display and force-push prevention](https://github.com/UnsafeLabs/Bounty-Hunters/issues/854)
+- 🔴 **$130** · [[ T3 Code ] Add syntax highlighting, copy button, and collapsible code blocks to](https://github.com/UnsafeLabs/Bounty-Hunters/issues/837)
+- 🔴 **$130** · [[ FastAPI ] Add brute force protection to HTTPBasic authentication](https://github.com/UnsafeLabs/Bounty-Hunters/issues/800)
+- 🔴 **$120** · [[ T3 Code ] Fix orchestration engine fiber interrupt not checkpointing partial s](https://github.com/UnsafeLabs/Bounty-Hunters/issues/818)
+- 🔴 **$120** · [[ Laravel ] Add rate limiting middleware to web routes and fix session driver fa](https://github.com/UnsafeLabs/Bounty-Hunters/issues/749)
+- 🔴 **$115** · [[ T3 Code ] Implement global search across chat, files, and git history](https://github.com/UnsafeLabs/Bounty-Hunters/issues/860)
+- 🔴 **$110** · [[ T3 Code ] Add visual keybinding editor with conflict detection and recording](https://github.com/UnsafeLabs/Bounty-Hunters/issues/843)
+- 🔴 **$110** · [[ Laravel ] Add global query scope, User observer with UUID, and lazy loading pr](https://github.com/UnsafeLabs/Bounty-Hunters/issues/792)
+- 🔴 **$100** · [[ T3 Code ] Add deep linking support via t3code:// custom protocol](https://github.com/UnsafeLabs/Bounty-Hunters/issues/864)
+- 🔴 **$95** · [[ T3 Code ] Add Prometheus metrics endpoint with Effect.Metric integration](https://github.com/UnsafeLabs/Bounty-Hunters/issues/833)
+- 🔴 **$95** · [[ FastAPI ] Add request-scoped dependency caching to reduce duplicate resolution](https://github.com/UnsafeLabs/Bounty-Hunters/issues/795)
+- 🔴 **$90** · [[ T3 Code ] Add system tray icon with context menu and status indicator](https://github.com/UnsafeLabs/Bounty-Hunters/issues/859)
+- 🔴 **$90** · [[ Laravel ] Add database health check endpoint with retry logic](https://github.com/UnsafeLabs/Bounty-Hunters/issues/785)
+- 🔴 **$85** · [[ T3 Code ] Add rebase conflict detection and resolution to GitManager](https://github.com/UnsafeLabs/Bounty-Hunters/issues/823)
+- 🔴 **$80** · [[ T3 Code ] Add inline commenting on diff lines in DiffPanelShell](https://github.com/UnsafeLabs/Bounty-Hunters/issues/846)
+- 🔴 **$80** · [[ FastAPI ] Add file size and content type validation to UploadFile](https://github.com/UnsafeLabs/Bounty-Hunters/issues/761)
+- 🔴 **$75** · [[ T3 Code ] Add update download progress, defer, and skip version to auto-update](https://github.com/UnsafeLabs/Bounty-Hunters/issues/842)
+- 🔴 **$75** · [[ Laravel ] Fix DatabaseSeeder creating duplicate test user on re-run and add pr](https://github.com/UnsafeLabs/Bounty-Hunters/issues/746)
+- 🔴 **$70** · [[ T3 Code ] Add fuzzy search with match highlighting to CommandPalette](https://github.com/UnsafeLabs/Bounty-Hunters/issues/830)
+- 🔴 **$70** · [[ FastAPI ] Fix generate_unique_id producing duplicate operation IDs across rout](https://github.com/UnsafeLabs/Bounty-Hunters/issues/764)
+- 🔴 **$65** · [[ T3 Code ] Add drag-and-drop file moving to sidebar file tree with dnd-kit](https://github.com/UnsafeLabs/Bounty-Hunters/issues/857)
+- 🔴 **$65** · [[ FastAPI ] Add StreamingCSVResponse for large dataset exports](https://github.com/UnsafeLabs/Bounty-Hunters/issues/799)
+- 🔴 **$60** · [[ T3 Code ] Add cross-platform copy/paste keybindings to terminal component](https://github.com/UnsafeLabs/Bounty-Hunters/issues/824)
+- 🔴 **$60** · [[ Laravel ] Fix .htaccess missing compression rules and add performance optimiza](https://github.com/UnsafeLabs/Bounty-Hunters/issues/755)
+- 🔴 **$55** · [[ T3 Code ] Add container, CI, and WSL environment detection to client runtime](https://github.com/UnsafeLabs/Bounty-Hunters/issues/836)
+- 🔴 **$55** · [[ Laravel ] Fix phpunit.xml coverage config and add route and model test suites](https://github.com/UnsafeLabs/Bounty-Hunters/issues/794)
+- 🔴 **$50** · [[ T3 Code ] Add ARIA attributes and keyboard navigation to ChatView](https://github.com/UnsafeLabs/Bounty-Hunters/issues/852)
+- 🔴 **$50** · [[ FastAPI ] Add concurrent task runner with semaphore limiting and timeout](https://github.com/UnsafeLabs/Bounty-Hunters/issues/803)
+- 🔴 **$50** · [[ Laravel ] Fix User model password cast not applying bcrypt rounds from config](https://github.com/UnsafeLabs/Bounty-Hunters/issues/745)
+- 🔴 **$50** · [BOUNTY: integrate AWS Comprehend as a utility to redact data](https://github.com/arakoodev/EdgeChains/issues/290)
+"""
+
+INITIAL_ALGORA_IDS = [
+    "4455330769", "4454368312", "4454367197", "4454365930", "4454364811",
+    "4454363780", "4454362039", "4454360925", "4454359696", "4454358484",
+    "4454357399", "4452275408", "4452274594", "4452273962", "4452272785",
+    "4452271542", "4452270931", "4452270280", "4452269545", "4452268942",
+    "4452267075", "4452265583", "4452264818", "4452144013", "4452142287",
+    "4452141660", "4452140801", "4452139277", "4452138393", "4452137652",
+    "4452136303", "4452134929", "4452134216", "4452133408", "4452131620",
+    "4452130146", "4452129385", "4452128623", "4452127725", "4452124414",
+    "4452123548", "4452122415", "4452121697", "4452120085", "4452118526",
+    "4452116789", "4452028862", "4452028177", "4452027546", "4452026271",
+    "4452025247", "4452024444", "4452023088", "4452022421", "4452021206",
+    "4452020408", "4452019731", "4452018151", "4452016425", "4452015213",
+    "4452014472", "4451710544", "4451709275", "4451707872", "4451706597",
+    "4451704233", "4451700910", "4451698518", "4451696592", "4451695139",
+    "4451692234", "4451689663", "4451686072", "4451685935", "4451685810",
+    "4975260101", "4557579802", "4557563229", "4557552603", "4557198290",
+    "4557184402",
+]
+
+
+def parse_bounties(raw_text: str, algora_ids: List[str]) -> List[Dict]:
+    pattern = re.compile(r"-\s*🔴\s*\*\*(\$\d+)\*\*\s*·\s*\[(.*?)\]\((.*?)\)")
+    bounties = []
+    lines = [line.strip() for line in raw_text.strip().splitlines() if line.strip()]
+
+    for idx, line in enumerate(lines):
+        match = pattern.search(line)
+        if match:
+            reward = match.group(1)
+            title = match.group(2)
+            url = match.group(3)
+            bounty_id = algora_ids[idx] if idx < len(algora_ids) else f"auto-{idx}"
+            bounties.append({
+                "reward": reward,
+                "title": title,
+                "url": url,
+                "id": bounty_id,
+            })
+    return bounties
+
+
+def create_github_issue(title: str, body: str) -> bool:
+    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
+        print(f"[DRY-RUN] Create issue: {title}")
+        return True
+
+    url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/issues"
+    payload = json.dumps({"title": title, "body": body}).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "Bounty-Watcher-Backfill",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            print(f"Created issue #{data.get('number')}: {title}")
+            return True
+    except Exception as e:
+        print(f"Failed to create issue for {title}: {e}", file=sys.stderr)
+        return False
+
+
+def run_backfill():
+    bounties = parse_bounties(INITIAL_BOUNTIES_RAW, INITIAL_ALGORA_IDS)
+    print(f"Parsed {len(bounties)} bounties for backfill.")
+
+    seen_ids: Set[str] = set()
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                seen_ids = set(data) if isinstance(data, list) else set(data.keys())
+        except Exception:
+            seen_ids = set()
+
+    created_count = 0
+    for b in bounties:
+        b_id = b["id"]
+        if b_id in seen_ids:
+            print(f"Skipping already seen bounty {b_id}: {b['title']}")
+            continue
+
+        issue_title = f"🔴 {b['reward']} · {b['title']}"
+        issue_body = (
+            f"### [{b['reward']}] {b['title']}\n\n"
+            f"- **Source Issue:** {b['url']}\n"
+            f"- **Reward:** {b['reward']}\n\n"
+            f"cc @{CC_USER}\n\n"
+            f"<!-- algora:gh-{b_id} -->\n"
+        )
+
+        if create_github_issue(issue_title, issue_body):
+            seen_ids.add(b_id)
+            created_count += 1
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(sorted(list(seen_ids)), f, indent=2)
+            time.sleep(1)
+
+    print(f"Backfill complete: created {created_count} individual issues.")
+
+
+if __name__ == "__main__":
+    run_backfill()
 ```
